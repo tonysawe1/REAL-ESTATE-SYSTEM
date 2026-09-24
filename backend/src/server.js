@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runMigrations, seed } from "./migrate.js";
+import { ensureUploadDirs } from "./uploads.js";
 import apiRoutes from "./routes/api.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -38,7 +39,8 @@ app.get("*", (req, res) => {
 
 runMigrations();
 seed();
+ensureUploadDirs();
 
 app.listen(PORT, () => {
-  console.log(`Real Estate System running at http://localhost:${PORT}`);
+  console.log(`MKUYU — Real Estate Management System running at http://localhost:${PORT}`);
 });

@@ -117,10 +117,47 @@ CREATE TABLE IF NOT EXISTS documents (
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','archived')),
   file_reference TEXT,
   notes TEXT,
+  original_filename TEXT,
+  stored_name TEXT,
+  file_size INTEGER,
+  mime_type TEXT,
+  uploaded_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
   FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE SET NULL,
   FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contract_id INTEGER NOT NULL,
+  debt_id INTEGER,
+  client_name TEXT NOT NULL,
+  amount REAL NOT NULL DEFAULT 0 CHECK(amount >= 0),
+  paid_at TEXT NOT NULL,
+  method TEXT NOT NULL DEFAULT 'cash' CHECK(method IN ('cash','bank','mobile','card','other')),
+  reference TEXT,
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE,
+  FOREIGN KEY (debt_id) REFERENCES debts(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  report_type TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'generated' CHECK(source IN ('generated','uploaded')),
+  project_id INTEGER,
+  description TEXT,
+  filters_json TEXT,
+  file_format TEXT,
+  original_filename TEXT,
+  stored_name TEXT,
+  file_size INTEGER,
+  mime_type TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -132,10 +169,26 @@ CREATE INDEX IF NOT EXISTS idx_properties_project ON properties(project_id);
 CREATE INDEX IF NOT EXISTS idx_clients_project ON clients(project_id);
 CREATE INDEX IF NOT EXISTS idx_appointments_client ON appointments(client_id);
 CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
+CREATE INDEX IF NOT EXISTS idx_payments_contract ON payments(contract_id);
+CREATE INDEX IF NOT EXISTS idx_payments_paid ON payments(paid_at);
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
 `;
 
 export function runMigrations() {
   db.exec(migrations);
+  ensureColumn("documents", "original_filename", "TEXT");
+  ensureColumn("documents", "stored_name", "TEXT");
+  ensureColumn("documents", "file_size", "INTEGER");
+  ensureColumn("documents", "mime_type", "TEXT");
+  ensureColumn("documents", "uploaded_at", "TEXT");
+}
+
+// Additive-only column migration: never modifies or drops existing columns.
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((entry) => entry.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 export function seed() {

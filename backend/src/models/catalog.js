@@ -1,7 +1,8 @@
 import db from "../db.js";
 
 function rowsWithProject(table, alias, joins, conditions, params) {
-  let sql = `SELECT ${table}.* FROM ${table}${alias}`;
+  const scope = alias.trim();
+  let sql = `SELECT ${scope}.* FROM ${table}${alias}`;
   if (joins) sql += joins;
   if (conditions.length) sql += " WHERE " + conditions.join(" AND ");
   return db.prepare(sql).all(...params);
@@ -99,9 +100,11 @@ export const Document = {
                        LEFT JOIN projects pr ON pr.id = d.project_id WHERE d.id = ?`).get(id);
   },
   create(data) {
-    return db.prepare(`INSERT INTO documents (project_id, contract_id, client_id, title, category, status, file_reference, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(data.project_id || null, data.contract_id || null, data.client_id || null, data.title, data.category, data.status, data.file_reference || null, data.notes || null);
+    return db.prepare(`INSERT INTO documents (project_id, contract_id, client_id, title, category, status, file_reference, notes, original_filename, stored_name, file_size, mime_type, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(data.project_id || null, data.contract_id || null, data.client_id || null, data.title, data.category, data.status, data.file_reference || null, data.notes || null, data.original_filename || null, data.stored_name || null, data.file_size ?? null, data.mime_type || null, data.uploaded_at || null);
   },
   update(id, data) {
+    // Metadata edits never clear an attached file: file columns are only
+    // written by the upload endpoint via Document.create().
     return db.prepare(`UPDATE documents SET project_id=?, contract_id=?, client_id=?, title=?, category=?, status=?, file_reference=?, notes=? WHERE id=?`).run(data.project_id || null, data.contract_id || null, data.client_id || null, data.title, data.category, data.status, data.file_reference || null, data.notes || null, id);
   },
   remove(id) { return db.prepare("DELETE FROM documents WHERE id = ?").run(id); },

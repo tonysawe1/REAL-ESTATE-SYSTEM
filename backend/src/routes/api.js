@@ -1,9 +1,14 @@
 import { Router } from "express";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { Project } from "../models/project.js";
 import { Contract } from "../models/contract.js";
 import { Debt } from "../models/debt.js";
+import { Payment } from "../models/payment.js";
 import { Reminder } from "../models/reminder.js";
 import { Report } from "../models/report.js";
+import { REPORT_TYPES, REPORT_TYPE_IDS, PAYMENT_METHODS, reportTypeLabel } from "../models/reportTypes.js";
 import { Property, Client, Appointment, Document } from "../models/catalog.js";
 import {
   hashPassword,
@@ -15,6 +20,21 @@ import {
   requireAuth,
 } from "../auth.js";
 import db from "../db.js";
+import { buildReport, parseFilters } from "../reports/builders.js";
+import { exportReport, EXPORT_FORMATS } from "../reports/exporters.js";
+import {
+  documentExtensions,
+  reportExtensions,
+  reportUploadsDir,
+  documentUploadsDir,
+  uploadDocumentFile,
+  uploadReportFile,
+  validateUploadedFile,
+  cleanupUploadedFile,
+  safeDisplayFilename,
+  resolveStoredFile,
+  removeStoredFile,
+} from "../uploads.js";
 
 const router = Router();
 const projectStatuses = new Set(["active", "archived"]);
@@ -29,6 +49,7 @@ const appointmentTypes = new Set(["viewing", "call", "meeting", "inspection"]);
 const appointmentStatuses = new Set(["scheduled", "completed", "cancelled"]);
 const documentCategories = new Set(["agreement", "title", "invoice", "receipt", "report", "permit", "other"]);
 const documentStatuses = new Set(["pending", "approved", "archived"]);
+const paymentMethods = new Set(PAYMENT_METHODS.map((entry) => entry.value));
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -39,11 +60,9 @@ class HttpError extends Error {
 
 function route(handler) {
   return (req, res, next) => {
-    try {
-      handler(req, res);
-    } catch (error) {
-      next(error);
-    }
+    Promise.resolve()
+      .then(() => handler(req, res, next))
+      .catch(next);
   };
 }
 
@@ -201,6 +220,84 @@ function validateDocument(body, current = {}) {
   };
 }
 
+function positiveNumber(value, field) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) throw new HttpError(400, `${field} must be greater than zero`);
+  return Math.round(number * 100) / 100;
+}
+
+function paymentDate(value) {
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) return optionalDate(value, "paid_at");
+  return optionalDateTime(value, "paid_at");
+}
+
+function validatePayment(body, current = {}) {
+  const contractId = parseId(body.contract_id ?? current.contract_id, "contract_id");
+  const contract = requireRecord(db.prepare("SELECT id, client_name FROM contracts WHERE id = ?").get(contractId), "Contract");
+  const debtId = parseId(body.debt_id ?? current.debt_id, "debt_id", true);
+  if (debtId) {
+    const debt = requireRecord(db.prepare("SELECT id, contract_id FROM debts WHERE id = ?").get(debtId), "Installment");
+    if (debt.contract_id !== contractId) throw new HttpError(400, "debt_id does not belong to the selected contract");
+  }
+  const paidAt = paymentDate(body.paid_at ?? current.paid_at);
+  if (!paidAt) throw new HttpError(400, "paid_at is required");
+  return {
+    contract_id: contractId,
+    debt_id: debtId,
+    client_name: requiredText(body.client_name ?? current.client_name ?? contract.client_name, "client_name"),
+    amount: positiveNumber(body.amount ?? current.amount, "amount"),
+    paid_at: paidAt,
+    method: enumValue(body.method ?? current.method, paymentMethods, "cash", "method"),
+    reference: optionalText(body.reference ?? current.reference, "reference", 160),
+    notes: optionalText(body.notes ?? current.notes, "notes"),
+  };
+}
+
+function reportTypeId(value) {
+  const id = requiredText(value, "report_type", 60).toLowerCase();
+  if (!REPORT_TYPE_IDS.has(id)) throw new HttpError(400, "report_type is invalid");
+  return id;
+}
+
+function reportFilters(type, raw = {}) {
+  try {
+    return parseFilters(type, raw);
+  } catch (error) {
+    throw new HttpError(400, error.message);
+  }
+}
+
+function historyFilters(query = {}) {
+  const source = query.source || null;
+  if (source && !["generated", "uploaded"].includes(source)) throw new HttpError(400, "source is invalid");
+  const reportType = query.report_type ? reportTypeId(query.report_type) : null;
+  return {
+    projectId: query.project_id === undefined ? null : parseId(query.project_id, "project_id"),
+    source,
+    reportType,
+    search: optionalText(query.search, "search", 120),
+    from: optionalDate(query.from, "from"),
+    to: optionalDate(query.to, "to"),
+  };
+}
+
+function documentResponse(document) {
+  if (!document) return document;
+  return { ...document, has_file: Boolean(document.stored_name), file_name: document.original_filename || null };
+}
+
+function reportResponse(report) {
+  if (!report) return report;
+  return { ...report, has_file: Boolean(report.stored_name), file_name: report.original_filename || null };
+}
+
+function sendStoredFile(res, fullPath, mimeType, filename, download = false) {
+  const safeName = safeDisplayFilename(filename, "download").replace(/"/g, "");
+  res.setHeader("Content-Type", mimeType || "application/octet-stream");
+  res.setHeader("Content-Disposition", `${download ? "attachment" : "inline"}; filename="${safeName}"`);
+  return res.sendFile(fullPath);
+}
+
 function requireRecord(record, label = "Record") {
   if (!record) throw new HttpError(404, `${label} not found`);
   return record;
@@ -321,6 +418,38 @@ router.delete("/debts/:id", route((req, res) => {
   res.json({ ok: true });
 }));
 
+router.get("/payments", route((req, res) => {
+  const projectId = req.query.project_id === undefined ? null : parseId(req.query.project_id, "project_id");
+  const contractId = req.query.contract_id === undefined ? null : parseId(req.query.contract_id, "contract_id");
+  const method = req.query.method || null;
+  if (method && !paymentMethods.has(method)) throw new HttpError(400, "method is invalid");
+  const from = optionalDate(req.query.from, "from");
+  const to = optionalDate(req.query.to, "to");
+  if (from && to && from > to) throw new HttpError(400, "from cannot be after to");
+  res.json(Payment.all({ projectId, contractId, method, from, to }));
+}));
+router.get("/payments/:id", route((req, res) => res.json(requireRecord(Payment.get(parseId(req.params.id)), "Payment"))));
+router.post("/payments", route((req, res) => {
+  const data = validatePayment(req.body || {});
+  const result = Payment.create(data);
+  if (data.debt_id) Payment.syncInstallment(data.debt_id);
+  res.status(201).json(Payment.get(Number(result.lastInsertRowid)));
+}));
+router.put("/payments/:id", route((req, res) => {
+  const id = parseId(req.params.id);
+  const current = requireRecord(Payment.get(id), "Payment");
+  const data = validatePayment(req.body || {}, current);
+  Payment.update(id, data);
+  if (data.debt_id) Payment.syncInstallment(data.debt_id);
+  res.json(Payment.get(id));
+}));
+router.delete("/payments/:id", route((req, res) => {
+  const id = parseId(req.params.id);
+  requireRecord(Payment.get(id), "Payment");
+  Payment.remove(id);
+  res.json({ ok: true });
+}));
+
 router.get("/reminders", route((req, res) => res.json(Reminder.due())));
 router.get("/reminders/upcoming", route((req, res) => {
   const days = req.query.days === undefined ? 30 : Number(req.query.days);
@@ -416,32 +545,159 @@ router.get("/documents", route((req, res) => {
   const status = req.query.status || null;
   const projectId = req.query.project_id === undefined ? null : parseId(req.query.project_id, "project_id");
   if (status && !documentStatuses.has(status)) throw new HttpError(400, "status is invalid");
-  res.json(Document.all(status, projectId));
+  res.json(Document.all(status, projectId).map(documentResponse));
 }));
-router.get("/documents/:id", route((req, res) => res.json(requireRecord(Document.get(parseId(req.params.id)), "Document"))));
+router.get("/documents/:id/file", route((req, res) => {
+  const document = requireRecord(Document.get(parseId(req.params.id)), "Document");
+  const fullPath = resolveStoredFile(documentUploadsDir, document.stored_name);
+  if (!fullPath) throw new HttpError(404, "No file is attached to this document");
+  return sendStoredFile(res, fullPath, document.mime_type, document.original_filename || document.stored_name, req.query.download === "1");
+}));
+router.get("/documents/:id", route((req, res) => res.json(documentResponse(requireRecord(Document.get(parseId(req.params.id)), "Document")))));
 router.post("/documents", route((req, res) => {
   const data = validateDocument(req.body || {});
   const result = Document.create(data);
-  res.status(201).json(Document.get(Number(result.lastInsertRowid)));
+  res.status(201).json(documentResponse(Document.get(Number(result.lastInsertRowid))));
+}));
+router.post("/documents/upload", uploadDocumentFile, route(async (req, res) => {
+  const fileInfo = validateUploadedFile(req.file, documentExtensions);
+  try {
+    const data = validateDocument({ ...(req.body || {}), file_reference: req.body?.file_reference || null });
+    const result = Document.create({
+      ...data,
+      original_filename: fileInfo.displayName,
+      stored_name: fileInfo.storedName,
+      file_size: fileInfo.size,
+      mime_type: fileInfo.mimeType,
+      uploaded_at: new Date().toISOString(),
+    });
+    res.status(201).json(documentResponse(Document.get(Number(result.lastInsertRowid))));
+  } catch (error) {
+    cleanupUploadedFile(req.file);
+    throw error;
+  }
 }));
 router.put("/documents/:id", route((req, res) => {
   const id = parseId(req.params.id);
   const current = requireRecord(Document.get(id), "Document");
   const data = validateDocument(req.body || {}, current);
   Document.update(id, data);
-  res.json(Document.get(id));
+  res.json(documentResponse(Document.get(id)));
 }));
 router.delete("/documents/:id", route((req, res) => {
   const id = parseId(req.params.id);
-  requireRecord(Document.get(id), "Document");
+  const current = requireRecord(Document.get(id), "Document");
+  removeStoredFile(documentUploadsDir, current.stored_name);
   Document.remove(id);
   res.json({ ok: true });
 }));
 
+router.get("/reports/types", route((req, res) => res.json({ types: REPORT_TYPES, payment_methods: PAYMENT_METHODS })));
+router.get("/reports/history", route((req, res) => res.json(Report.history(historyFilters(req.query)).map(reportResponse))));
+router.post("/reports/preview", route((req, res) => {
+  const type = reportTypeId(req.body?.report_type);
+  const filters = reportFilters(type, req.body || {});
+  res.json(buildReport(type, filters));
+}));
+router.post("/reports/generate", route(async (req, res) => {
+  const type = reportTypeId(req.body?.report_type);
+  const format = String(req.body?.format || "xlsx").toLowerCase();
+  if (!EXPORT_FORMATS[format]) throw new HttpError(400, "format must be xlsx, pdf, docx or pptx");
+  const filters = reportFilters(type, req.body || {});
+  const payload = buildReport(type, filters);
+  const title = optionalText(req.body?.title, "title", 160) || payload.title;
+  const output = await exportReport({ ...payload, title }, format);
+  // Store the generated file only after the DB row has been written, so a failed
+  // insert never leaves an orphan file behind.
+  const storedName = `${crypto.randomUUID()}${output.extension}`;
+  const fullPath = path.join(reportUploadsDir, storedName);
+  fs.mkdirSync(reportUploadsDir, { recursive: true });
+  let report;
+  try {
+    report = Report.create({
+      title,
+      report_type: type,
+      source: "generated",
+      project_id: filters.project || parseId(req.body?.project_id, "project_id", true),
+      description: payload.description,
+      filters_json: JSON.stringify(filters),
+      file_format: format,
+      original_filename: output.fileName,
+      stored_name: storedName,
+      file_size: output.buffer.length,
+      mime_type: output.mime,
+    });
+    fs.writeFileSync(fullPath, output.buffer);
+  } catch (error) {
+    removeStoredFile(reportUploadsDir, storedName);
+    throw error;
+  }
+  res.status(201).json(reportResponse(report));
+}));
+router.post("/reports/upload", uploadReportFile, route(async (req, res) => {
+  try {
+    const fileInfo = validateUploadedFile(req.file, reportExtensions);
+    const type = reportTypeId(req.body?.report_type);
+    const title = requiredText(req.body?.title || fileInfo.displayName, "title", 160);
+    const filters = reportFilters(type, req.body || {});
+    const report = Report.create({
+      title,
+      report_type: type,
+      source: "uploaded",
+      project_id: parseId(req.body?.project_id, "project_id", true),
+      description: optionalText(req.body?.description, "description", 2000),
+      filters_json: Object.keys(filters).length ? JSON.stringify(filters) : null,
+      file_format: fileInfo.extension.slice(1),
+      original_filename: fileInfo.displayName,
+      stored_name: fileInfo.storedName,
+      file_size: fileInfo.size,
+      mime_type: fileInfo.mimeType,
+    });
+    res.status(201).json(reportResponse(report));
+  } catch (error) {
+    cleanupUploadedFile(req.file);
+    throw error;
+  }
+}));
 router.get("/reports/summary", route((req, res) => res.json(Report.summary())));
 router.get("/reports/by-project", route((req, res) => res.json(Report.byProject())));
 router.get("/reports/new-contracts", route((req, res) => res.json(Report.newContracts())));
 router.get("/reports/terminal-contracts", route((req, res) => res.json(Report.terminalContracts())));
+router.get("/reports/:id/file", route((req, res) => {
+  const report = requireRecord(Report.get(parseId(req.params.id)), "Report");
+  const fullPath = resolveStoredFile(reportUploadsDir, report.stored_name);
+  if (!fullPath) throw new HttpError(404, "No file is attached to this report");
+  return sendStoredFile(res, fullPath, report.mime_type, report.original_filename || report.stored_name, req.query.download === "1");
+}));
+router.get("/reports/:id/export", route(async (req, res) => {
+  const report = requireRecord(Report.get(parseId(req.params.id)), "Report");
+  const format = String(req.query.format || report.file_format || "xlsx").toLowerCase();
+  if (!EXPORT_FORMATS[format]) throw new HttpError(400, "format must be xlsx, pdf, docx or pptx");
+  if (report.source === "uploaded") {
+    const fullPath = resolveStoredFile(reportUploadsDir, report.stored_name);
+    if (!fullPath) throw new HttpError(404, "No file is attached to this report");
+    return sendStoredFile(res, fullPath, report.mime_type, report.original_filename || report.stored_name, true);
+  }
+  let filters = {};
+  try {
+    filters = report.filters_json ? JSON.parse(report.filters_json) : {};
+  } catch (error) {
+    throw new HttpError(500, "The saved report filters are invalid");
+  }
+  const payload = buildReport(report.report_type, reportFilters(report.report_type, filters));
+  const output = await exportReport(payload, format);
+  res.setHeader("Content-Type", output.mime);
+  res.setHeader("Content-Disposition", `attachment; filename="${safeDisplayFilename(output.fileName, "report").replace(/"/g, "")}"`);
+  return res.send(output.buffer);
+}));
+router.get("/reports/:id", route((req, res) => res.json(reportResponse(requireRecord(Report.get(parseId(req.params.id)), "Report")))));
+router.delete("/reports/:id", route((req, res) => {
+  const id = parseId(req.params.id);
+  const report = requireRecord(Report.get(id), "Report");
+  Report.remove(id);
+  removeStoredFile(reportUploadsDir, report.stored_name);
+  res.json({ ok: true });
+}));
 
 router.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
