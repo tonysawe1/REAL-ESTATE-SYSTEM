@@ -14,10 +14,20 @@ export const Property = {
     const params = [];
     if (projectId) { conditions.push("pr.id = ?"); params.push(projectId); }
     if (status) { conditions.push("p.status = ?"); params.push(status); }
-    return rowsWithProject("properties", " p", " LEFT JOIN projects pr ON pr.id = p.project_id", conditions, params);
+    let sql = `SELECT p.*, pr.name as project_name,
+                      (SELECT COUNT(*) FROM property_images pi WHERE pi.property_id = p.id) as image_count,
+                      (SELECT id FROM property_images pi WHERE pi.property_id = p.id ORDER BY pi.id ASC LIMIT 1) as cover_image_id
+               FROM properties p
+               LEFT JOIN projects pr ON pr.id = p.project_id`;
+    if (conditions.length) sql += " WHERE " + conditions.join(" AND ");
+    sql += " ORDER BY p.id ASC";
+    return db.prepare(sql).all(...params);
   },
   get(id) {
-    return db.prepare("SELECT p.*, pr.name as project_name FROM properties p LEFT JOIN projects pr ON pr.id = p.project_id WHERE p.id = ?").get(id);
+    return db.prepare(`SELECT p.*, pr.name as project_name,
+                       (SELECT COUNT(*) FROM property_images pi WHERE pi.property_id = p.id) as image_count,
+                       (SELECT id FROM property_images pi WHERE pi.property_id = p.id ORDER BY pi.id ASC LIMIT 1) as cover_image_id
+                       FROM properties p LEFT JOIN projects pr ON pr.id = p.project_id WHERE p.id = ?`).get(id);
   },
   create(data) {
     return db.prepare(`INSERT INTO properties (project_id, name, property_type, status, price, location, area, bedrooms, bathrooms, description, featured) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(data.project_id || null, data.name, data.property_type, data.status, data.price, data.location, data.area, data.bedrooms || 0, data.bathrooms || 0, data.description || null, data.featured ? 1 : 0);
@@ -26,6 +36,23 @@ export const Property = {
     return db.prepare(`UPDATE properties SET project_id=?, name=?, property_type=?, status=?, price=?, location=?, area=?, bedrooms=?, bathrooms=?, description=?, featured=? WHERE id=?`).run(data.project_id || null, data.name, data.property_type, data.status, data.price, data.location, data.area, data.bedrooms || 0, data.bathrooms || 0, data.description || null, data.featured ? 1 : 0, id);
   },
   remove(id) { return db.prepare("DELETE FROM properties WHERE id = ?").run(id); },
+};
+
+// Optional property picture gallery: properties never require pictures.
+export const PropertyImage = {
+  listFor(propertyId) {
+    return db.prepare("SELECT * FROM property_images WHERE property_id = ? ORDER BY id ASC").all(propertyId);
+  },
+  get(propertyId, imageId) {
+    return db.prepare("SELECT * FROM property_images WHERE property_id = ? AND id = ?").get(propertyId, imageId);
+  },
+  countFor(propertyId) {
+    return db.prepare("SELECT COUNT(*) as count FROM property_images WHERE property_id = ?").get(propertyId).count;
+  },
+  create(propertyId, data) {
+    return db.prepare(`INSERT INTO property_images (property_id, original_filename, stored_name, file_size, mime_type) VALUES (?, ?, ?, ?, ?)`).run(propertyId, data.original_filename || null, data.stored_name, data.file_size ?? null, data.mime_type || null);
+  },
+  remove(imageId) { return db.prepare("DELETE FROM property_images WHERE id = ?").run(imageId); },
 };
 
 export const Client = {

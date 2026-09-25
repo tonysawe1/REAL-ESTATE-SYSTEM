@@ -2,8 +2,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { runMigrations, seed } from "./migrate.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { runMigrations } from "./migrate.js";
 import { ensureUploadDirs } from "./uploads.js";
 import apiRoutes from "./routes/api.js";
 
@@ -38,9 +38,16 @@ app.get("*", (req, res) => {
 });
 
 runMigrations();
-seed();
+// Intentionally no seed() on startup — demo data is only inserted via `npm run seed`.
 ensureUploadDirs();
 
-app.listen(PORT, () => {
-  console.log(`MKUYU — Real Estate Management System running at http://localhost:${PORT}`);
-});
+function startServer(port = PORT) {
+  return app.listen(port, () => {
+    console.log(`MKUYU — Real Estate Management System running at http://localhost:${port}`);
+  });
+}
+
+// Importing the app for integration tests must not unexpectedly claim a port.
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) startServer();
+
+export { app, startServer };

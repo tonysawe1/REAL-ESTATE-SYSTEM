@@ -2,21 +2,31 @@ import multer from "multer";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import dotenv from "dotenv";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..", "..");
+dotenv.config({ path: path.join(projectRoot, ".env") });
+const configuredDataRoot = process.env.DATA_DIR;
+const runtimeDataRoot = configuredDataRoot
+  ? (path.isAbsolute(configuredDataRoot) ? configuredDataRoot : path.resolve(projectRoot, configuredDataRoot))
+  : path.join(projectRoot, "data");
 
 export const MAX_UPLOAD_BYTES = 15 * 1024 * 1024; // 15 MB per file
-export const uploadsRoot = path.join(projectRoot, "data", "uploads");
+export const uploadsRoot = path.join(runtimeDataRoot, "uploads");
 export const documentUploadsDir = path.join(uploadsRoot, "documents");
 export const reportUploadsDir = path.join(uploadsRoot, "reports");
+export const propertyUploadsDir = path.join(uploadsRoot, "properties");
+export const backupsDir = path.join(runtimeDataRoot, "backups");
 
 export const documentExtensions = new Set([
   ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
   ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
 ]);
 export const reportExtensions = new Set([".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"]);
+// Property pictures are optional and image-only.
+export const propertyImageExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
 
 export const extensionMime = {
   ".pdf": "application/pdf",
@@ -37,6 +47,7 @@ export const extensionMime = {
 export function ensureUploadDirs() {
   fs.mkdirSync(documentUploadsDir, { recursive: true });
   fs.mkdirSync(reportUploadsDir, { recursive: true });
+  fs.mkdirSync(propertyUploadsDir, { recursive: true });
 }
 
 export function safeExtension(originalName) {
@@ -111,6 +122,7 @@ function makeUploader(directory, allowedExtensions) {
 
 export const uploadDocumentFile = makeUploader(documentUploadsDir, documentExtensions);
 export const uploadReportFile = makeUploader(reportUploadsDir, reportExtensions);
+export const uploadPropertyImageFile = makeUploader(propertyUploadsDir, propertyImageExtensions);
 
 export function validateUploadedFile(file, allowedExtensions) {
   if (!file) {

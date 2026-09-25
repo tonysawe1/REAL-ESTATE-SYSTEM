@@ -1,11 +1,13 @@
 import db from "../db.js";
 
 const paymentSelect = `SELECT p.*, c.project_id, c.contract_type, c.status as contract_status,
-                              pr.name as project_name, d.due_date as installment_due, d.notes as installment_notes
+                              pr.name as project_name, d.due_date as installment_due, d.notes as installment_notes,
+                              doc.original_filename as receipt_filename, doc.stored_name as receipt_stored_name, doc.mime_type as receipt_mime_type
                        FROM payments p
                        JOIN contracts c ON c.id = p.contract_id
                        LEFT JOIN projects pr ON pr.id = c.project_id
-                       LEFT JOIN debts d ON d.id = p.debt_id`;
+                       LEFT JOIN debts d ON d.id = p.debt_id
+                       LEFT JOIN documents doc ON doc.id = p.receipt_document_id`;
 
 export const Payment = {
   all(filters = {}) {
@@ -47,6 +49,10 @@ export const Payment = {
       data.reference || null, data.notes || null, id
     );
   },
+  // Attach or replace the receipt document link (file columns live on documents).
+  setReceipt(id, documentId) {
+    return db.prepare("UPDATE payments SET receipt_document_id = ? WHERE id = ?").run(documentId || null, id);
+  },
   remove(id) {
     return db.prepare("DELETE FROM payments WHERE id = ?").run(id);
   },
@@ -63,13 +69,22 @@ export const Payment = {
     if (conditions.length) sql += " WHERE " + conditions.join(" AND ");
     return db.prepare(sql).get(...params);
   },
-  // Once recorded payments fully cover an installment, mark it paid (non-destructive bookkeeping).
-  syncInstallment(debtId) {
+  // Payments are the source of truth for automatic installment settlement.
+  // `force` is used after a payment is deleted or moved: even a manually
+  // settled installment must become open again when its only payment goes away.
+  syncInstallment(debtId, force = false) {
     if (!debtId) return;
-    const debt = db.prepare("SELECT id, amount, status FROM debts WHERE id = ?").get(debtId);
-    if (!debt || debt.status === "paid") return;
+    const debt = db.prepare("SELECT id, amount, due_date, status FROM debts WHERE id = ?").get(debtId);
+    if (!debt) return;
     const paid = db.prepare("SELECT COALESCE(SUM(amount),0) as total FROM payments WHERE debt_id = ?").get(debtId).total;
-    if (paid >= debt.amount && debt.amount > 0) db.prepare("UPDATE debts SET status = 'paid' WHERE id = ?").run(debtId);
+    if (!force && paid === 0 && debt.status === "paid") return;
+    let status;
+    if (debt.amount > 0 && paid >= debt.amount) {
+      status = "paid";
+    } else {
+      status = debt.due_date && debt.due_date < db.prepare("SELECT date('now') AS today").get().today ? "overdue" : "pending";
+    }
+    if (status !== debt.status) db.prepare("UPDATE debts SET status = ? WHERE id = ?").run(status, debtId);
   },
   // Payments made against a contract (optionally only those linked to a given debt).
   forDebt(debtId) {

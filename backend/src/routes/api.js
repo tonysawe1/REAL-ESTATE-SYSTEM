@@ -9,7 +9,7 @@ import { Payment } from "../models/payment.js";
 import { Reminder } from "../models/reminder.js";
 import { Report } from "../models/report.js";
 import { REPORT_TYPES, REPORT_TYPE_IDS, PAYMENT_METHODS, reportTypeLabel } from "../models/reportTypes.js";
-import { Property, Client, Appointment, Document } from "../models/catalog.js";
+import { Property, Client, Appointment, Document, PropertyImage } from "../models/catalog.js";
 import {
   hashPassword,
   verifyPassword,
@@ -27,8 +27,12 @@ import {
   reportExtensions,
   reportUploadsDir,
   documentUploadsDir,
+  propertyUploadsDir,
+  propertyImageExtensions,
+  backupsDir,
   uploadDocumentFile,
   uploadReportFile,
+  uploadPropertyImageFile,
   validateUploadedFile,
   cleanupUploadedFile,
   safeDisplayFilename,
@@ -50,6 +54,7 @@ const appointmentStatuses = new Set(["scheduled", "completed", "cancelled"]);
 const documentCategories = new Set(["agreement", "title", "invoice", "receipt", "report", "permit", "other"]);
 const documentStatuses = new Set(["pending", "approved", "archived"]);
 const paymentMethods = new Set(PAYMENT_METHODS.map((entry) => entry.value));
+const MAX_PROPERTY_IMAGES = 12;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -139,6 +144,7 @@ function validateProject(body, current = {}) {
 function validateContract(body, current = {}) {
   const data = {
     project_id: parseId(body.project_id ?? current.project_id, "project_id"),
+    client_id: parseId(body.client_id ?? current.client_id, "client_id", true),
     client_name: requiredText(body.client_name ?? current.client_name, "client_name"),
     contract_type: enumValue(body.contract_type ?? current.contract_type, contractTypes, "new", "contract_type"),
     status: enumValue(body.status ?? current.status, contractStatuses, "active", "status"),
@@ -147,8 +153,51 @@ function validateContract(body, current = {}) {
     end_date: optionalDate(body.end_date ?? current.end_date, "end_date"),
     notes: optionalText(body.notes ?? current.notes, "notes"),
   };
+  if (data.client_id) requireRecord(Client.get(data.client_id), "Client");
   if (data.start_date && data.end_date && data.end_date < data.start_date) throw new HttpError(400, "end_date cannot be before start_date");
   return data;
+}
+
+// Builds an equal-installment schedule: optional deposit due at start, then N
+// monthly installments. Cents-safe: the last installment absorbs rounding.
+// Dates are computed in UTC to stay independent of the server timezone.
+function buildSchedule(contract, { deposit, installments, firstDueDate }) {
+  const rows = [];
+  const start = contract.start_date || firstDueDate;
+  if (deposit > 0) {
+    rows.push({ amount: deposit, due_date: start, label: "Deposit" });
+  }
+  const remaining = Math.round((contract.value - deposit) * 100) / 100;
+  const base = Math.floor((remaining / installments) * 100) / 100;
+  const [year, month, day] = firstDueDate.split("-").map(Number);
+  let allocated = 0;
+  for (let index = 0; index < installments; index += 1) {
+    const amount = index === installments - 1
+      ? Math.round((remaining - allocated) * 100) / 100
+      : base;
+    allocated = Math.round((allocated + amount) * 100) / 100;
+    const anchor = new Date(Date.UTC(year, month - 1 + index, 1));
+    const lastDay = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 0)).getUTCDate();
+    const dueDay = Math.min(day, lastDay);
+    const dueDate = `${anchor.getUTCFullYear()}-${String(anchor.getUTCMonth() + 1).padStart(2, "0")}-${String(dueDay).padStart(2, "0")}`;
+    rows.push({
+      amount,
+      due_date: dueDate,
+      label: `Installment ${index + 1}/${installments}`,
+    });
+  }
+  return rows.filter((row) => row.amount > 0);
+}
+
+function validateSchedule(body) {
+  const installments = Number(body.installments);
+  if (!Number.isInteger(installments) || installments < 1 || installments > 120) {
+    throw new HttpError(400, "installments must be an integer between 1 and 120");
+  }
+  const deposit = nonNegativeNumber(body.deposit, "deposit", 0);
+  const firstDueDate = optionalDate(body.first_due_date, "first_due_date");
+  if (!firstDueDate) throw new HttpError(400, "first_due_date is required");
+  return { installments, deposit, firstDueDate };
 }
 
 function validateDebt(body, current = {}) {
@@ -286,6 +335,46 @@ function documentResponse(document) {
   return { ...document, has_file: Boolean(document.stored_name), file_name: document.original_filename || null };
 }
 
+function paymentResponse(payment) {
+  if (!payment) return payment;
+  return {
+    ...payment,
+    has_receipt: Boolean(payment.receipt_stored_name),
+    receipt_file_name: payment.receipt_filename || null,
+  };
+}
+
+// Reminder timing: 3 days before the due date, clamped to "now" when closer.
+function reminderTimeFor(dueDate) {
+  if (!dueDate) return null;
+  const due = new Date(`${dueDate}T09:00:00`);
+  const remind = new Date(due.getTime() - 3 * 86400000);
+  const now = new Date();
+  const target = remind > now ? remind : now;
+  return target.toISOString().replace("T", " ").slice(0, 19);
+}
+
+function syncDebtReminder(debtId, dueDate, status) {
+  Reminder.sync(debtId, status === "paid" ? null : reminderTimeFor(dueDate));
+}
+
+// After a payment changes installment state, retime/clear from the stored debt.
+function syncDebtReminderFromDb(debtId) {
+  const debt = db.prepare("SELECT due_date, status FROM debts WHERE id = ?").get(debtId);
+  if (debt) syncDebtReminder(debtId, debt.due_date, debt.status);
+}
+
+// A payment create/update/delete can move between installments: resync every
+// installment it touches (old + new debt link) so installment status and
+// reminders always match the payment ledger. `force` reopens installments that
+// lost their only payment.
+function resyncInstallmentState(debtIds) {
+  for (const debtId of [...new Set((debtIds || []).filter(Boolean).map(Number))]) {
+    Payment.syncInstallment(debtId, true);
+    syncDebtReminderFromDb(debtId);
+  }
+}
+
 function reportResponse(report) {
   if (!report) return report;
   return { ...report, has_file: Boolean(report.stored_name), file_name: report.original_filename || null };
@@ -380,6 +469,44 @@ router.delete("/contracts/:id", route((req, res) => {
   res.json({ ok: true });
 }));
 
+// Generate an optional payment schedule (deposit + equal monthly installments).
+router.post("/contracts/:id/schedule", route((req, res) => {
+  const id = parseId(req.params.id);
+  const contract = requireRecord(Contract.get(id), "Contract");
+  const { installments, deposit, firstDueDate } = validateSchedule(req.body || {});
+  if (!(contract.value > 0)) throw new HttpError(400, "contract value must be greater than 0");
+  if (deposit >= contract.value) throw new HttpError(400, "deposit must be less than the contract value");
+  const replaceRequested = req.body?.replace === true || req.body?.replace === "true";
+  const existing = db.prepare("SELECT COUNT(*) as count FROM debts WHERE contract_id = ?").get(id).count;
+  if (existing > 0 && !replaceRequested) {
+    throw new HttpError(409, "contract already has installments; set replace=true to regenerate");
+  }
+  // Replacing drops the old installments, so refuse when any current installment
+  // already has recorded payments — deleting them would orphan payment history.
+  if (replaceRequested && existing > 0) {
+    const withPayments = db.prepare(
+      "SELECT COUNT(*) as count FROM debts d WHERE d.contract_id = ? AND EXISTS (SELECT 1 FROM payments p WHERE p.debt_id = d.id)"
+    ).get(id).count;
+    if (withPayments > 0) {
+      throw new HttpError(409, "cannot replace the schedule: some installments already have recorded payments");
+    }
+  }
+  const rows = buildSchedule(contract, { deposit, installments, firstDueDate });
+  const create = db.prepare(`INSERT INTO debts (contract_id, client_name, amount, due_date, status, notes)
+                             VALUES (?, ?, ?, ?, 'pending', ?)`);
+  const createdIds = [];
+  const tx = db.transaction(() => {
+    if (existing > 0) db.prepare("DELETE FROM debts WHERE contract_id = ?").run(id);
+    for (const row of rows) {
+      const result = create.run(id, contract.client_name, row.amount, row.due_date, row.label);
+      createdIds.push(Number(result.lastInsertRowid));
+    }
+  });
+  tx();
+  createdIds.forEach((debtId) => syncDebtReminder(debtId, db.prepare("SELECT due_date, status FROM debts WHERE id = ?").get(debtId).due_date, "pending"));
+  res.status(201).json({ created: createdIds.length, debts: db.prepare("SELECT * FROM debts WHERE contract_id = ? ORDER BY due_date ASC").all(id) });
+}));
+
 router.get("/debts/overdue", route((req, res) => res.json(Debt.overdue())));
 router.get("/debts/upcoming", route((req, res) => {
   const days = req.query.days === undefined ? 7 : Number(req.query.days);
@@ -396,19 +523,25 @@ router.get("/debts/:id", route((req, res) => res.json(requireRecord(Debt.get(par
 router.post("/debts", route((req, res) => {
   const data = validateDebt(req.body || {});
   const result = Debt.create(data);
-  res.status(201).json(Debt.get(Number(result.lastInsertRowid)));
+  const id = Number(result.lastInsertRowid);
+  syncDebtReminder(id, data.due_date, data.status || "pending");
+  res.status(201).json(Debt.get(id));
 }));
 router.put("/debts/:id", route((req, res) => {
   const id = parseId(req.params.id);
   const current = requireRecord(Debt.get(id), "Debt");
   const data = validateDebt(req.body || {}, current);
   Debt.update(id, data);
+  syncDebtReminder(id, data.due_date, data.status || "pending");
   res.json(Debt.get(id));
 }));
 router.post("/debts/:id/pay", route((req, res) => {
   const id = parseId(req.params.id);
   requireRecord(Debt.get(id), "Debt");
-  Debt.markPaid(id);
+  db.transaction(() => {
+    Debt.markPaid(id);
+    Reminder.sync(id, null);
+  })();
   res.json(Debt.get(id));
 }));
 router.delete("/debts/:id", route((req, res) => {
@@ -426,27 +559,128 @@ router.get("/payments", route((req, res) => {
   const from = optionalDate(req.query.from, "from");
   const to = optionalDate(req.query.to, "to");
   if (from && to && from > to) throw new HttpError(400, "from cannot be after to");
-  res.json(Payment.all({ projectId, contractId, method, from, to }));
+  res.json(Payment.all({ projectId, contractId, method, from, to }).map(paymentResponse));
 }));
-router.get("/payments/:id", route((req, res) => res.json(requireRecord(Payment.get(parseId(req.params.id)), "Payment"))));
+router.get("/payments/:id", route((req, res) => res.json(paymentResponse(requireRecord(Payment.get(parseId(req.params.id)), "Payment")))));
 router.post("/payments", route((req, res) => {
   const data = validatePayment(req.body || {});
-  const result = Payment.create(data);
-  if (data.debt_id) Payment.syncInstallment(data.debt_id);
-  res.status(201).json(Payment.get(Number(result.lastInsertRowid)));
+  if (data.debt_id) requireRecord(Debt.get(data.debt_id), "Debt");
+  // Payment and its installment/reminder resync commit together or not at all.
+  const paymentId = db.transaction(() => {
+    const result = Payment.create(data);
+    resyncInstallmentState([data.debt_id]);
+    return Number(result.lastInsertRowid);
+  })();
+  res.status(201).json(paymentResponse(Payment.get(paymentId)));
+}));
+// Create a payment with an optional receipt file in one request.
+router.post("/payments/upload", uploadDocumentFile, route(async (req, res) => {
+  let paymentId = null;
+  try {
+    const data = validatePayment(req.body || {});
+    if (data.debt_id) requireRecord(Debt.get(data.debt_id), "Debt");
+    // Validate file/contract before opening the write transaction.
+    const fileInfo = req.file ? validateUploadedFile(req.file, documentExtensions) : null;
+    const contract = fileInfo ? requireRecord(Contract.get(data.contract_id), "Contract") : null;
+    // Payment, receipt link, and installment/reminder resync commit atomically.
+    db.transaction(() => {
+      const result = Payment.create(data);
+      paymentId = Number(result.lastInsertRowid);
+      if (fileInfo) {
+        const document = Document.create({
+          project_id: contract.project_id || null,
+          contract_id: contract.id,
+          client_id: null,
+          title: `Receipt · ${contract.client_name} · ${data.paid_at}`,
+          category: "receipt",
+          status: "approved",
+          notes: data.reference || null,
+          original_filename: fileInfo.displayName,
+          stored_name: fileInfo.storedName,
+          file_size: fileInfo.size,
+          mime_type: fileInfo.mimeType,
+          uploaded_at: new Date().toISOString(),
+        });
+        Payment.setReceipt(paymentId, Number(document.lastInsertRowid));
+      }
+      resyncInstallmentState([data.debt_id]);
+    })();
+  } catch (error) {
+    // The transaction already rolled back; this remove is a defensive no-op.
+    if (paymentId) Payment.remove(paymentId);
+    cleanupUploadedFile(req.file);
+    throw error;
+  }
+  res.status(201).json(paymentResponse(Payment.get(paymentId)));
 }));
 router.put("/payments/:id", route((req, res) => {
   const id = parseId(req.params.id);
   const current = requireRecord(Payment.get(id), "Payment");
   const data = validatePayment(req.body || {}, current);
-  Payment.update(id, data);
-  if (data.debt_id) Payment.syncInstallment(data.debt_id);
-  res.json(Payment.get(id));
+  if (data.debt_id && data.debt_id !== current.debt_id) requireRecord(Debt.get(data.debt_id), "Debt");
+  // Update + resync of the old AND new installment links commit atomically.
+  db.transaction(() => {
+    Payment.update(id, data);
+    resyncInstallmentState([current.debt_id, data.debt_id]);
+  })();
+  res.json(paymentResponse(Payment.get(id)));
+}));
+// Attach or replace a receipt on an existing payment.
+router.post("/payments/:id/receipt", uploadDocumentFile, route((req, res) => {
+  const id = parseId(req.params.id);
+  const payment = requireRecord(Payment.get(id), "Payment");
+  try {
+    const fileInfo = validateUploadedFile(req.file, documentExtensions);
+    const contract = requireRecord(Contract.get(payment.contract_id), "Contract");
+    const document = Document.create({
+      project_id: contract.project_id || null,
+      contract_id: contract.id,
+      client_id: null,
+      title: `Receipt · ${contract.client_name} · ${payment.paid_at}`,
+      category: "receipt",
+      status: "approved",
+      notes: payment.reference || null,
+      original_filename: fileInfo.displayName,
+      stored_name: fileInfo.storedName,
+      file_size: fileInfo.size,
+      mime_type: fileInfo.mimeType,
+      uploaded_at: new Date().toISOString(),
+    });
+    const newDocumentId = Number(document.lastInsertRowid);
+    const previous = payment.receipt_document_id ? Document.get(payment.receipt_document_id) : null;
+    Payment.setReceipt(id, newDocumentId);
+    if (previous) {
+      Document.remove(previous.id);
+      removeStoredFile(documentUploadsDir, previous.stored_name);
+    }
+  } catch (error) {
+    cleanupUploadedFile(req.file);
+    throw error;
+  }
+  res.json(paymentResponse(Payment.get(id)));
+}));
+router.get("/payments/:id/receipt", route((req, res) => {
+  const payment = requireRecord(Payment.get(parseId(req.params.id)), "Payment");
+  if (!payment.receipt_stored_name) throw new HttpError(404, "No receipt is attached to this payment");
+  const fullPath = resolveStoredFile(documentUploadsDir, payment.receipt_stored_name);
+  if (!fullPath) throw new HttpError(404, "Receipt file not found");
+  return sendStoredFile(res, fullPath, payment.receipt_mime_type || null, payment.receipt_filename || payment.receipt_stored_name, req.query.download === "1");
 }));
 router.delete("/payments/:id", route((req, res) => {
   const id = parseId(req.params.id);
-  requireRecord(Payment.get(id), "Payment");
-  Payment.remove(id);
+  const payment = requireRecord(Payment.get(id), "Payment");
+  // Delete + forced installment reopen (and reminder retiming) commit together.
+  db.transaction(() => {
+    Payment.remove(id);
+    resyncInstallmentState([payment.debt_id]);
+  })();
+  if (payment.receipt_document_id) {
+    const document = Document.get(payment.receipt_document_id);
+    if (document) {
+      Document.remove(document.id);
+      removeStoredFile(documentUploadsDir, document.stored_name);
+    }
+  }
   res.json({ ok: true });
 }));
 
@@ -460,6 +694,44 @@ router.post("/reminders/:id/acknowledge", route((req, res) => {
   const id = parseId(req.params.id);
   const result = Reminder.acknowledge(id);
   if (!result.changes) throw new HttpError(404, "Reminder not found");
+  res.json({ ok: true });
+}));
+
+// ---- Backups: consistent SQLite copies in data/backups ----
+
+function listBackups() {
+  if (!fs.existsSync(backupsDir)) return [];
+  return fs.readdirSync(backupsDir)
+    .filter((name) => name.endsWith(".db"))
+    .map((name) => {
+      const stats = fs.statSync(path.join(backupsDir, name));
+      return { name, size: stats.size, created_at: stats.mtime.toISOString() };
+    })
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+router.get("/backups", route((req, res) => res.json(listBackups())));
+router.post("/backups", route(async (req, res) => {
+  fs.mkdirSync(backupsDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const name = `system-${stamp}.db`;
+  // SQLite's backup API produces a consistent copy even while WAL is active.
+  await db.backup(path.join(backupsDir, name));
+  res.status(201).json(listBackups().find((entry) => entry.name === name));
+}));
+router.get("/backups/:name/download", route((req, res) => {
+  const name = path.basename(String(req.params.name || ""));
+  if (!/^system-[\w-]+\.db$/.test(name)) throw new HttpError(400, "invalid backup name");
+  const fullPath = resolveStoredFile(backupsDir, name);
+  if (!fullPath) throw new HttpError(404, "Backup not found");
+  return sendStoredFile(res, fullPath, "application/octet-stream", name, true);
+}));
+router.delete("/backups/:name", route((req, res) => {
+  const name = path.basename(String(req.params.name || ""));
+  if (!/^system-[\w-]+\.db$/.test(name)) throw new HttpError(400, "invalid backup name");
+  const fullPath = resolveStoredFile(backupsDir, name);
+  if (!fullPath) throw new HttpError(404, "Backup not found");
+  fs.unlinkSync(fullPath);
   res.json({ ok: true });
 }));
 
@@ -485,7 +757,54 @@ router.put("/properties/:id", route((req, res) => {
 router.delete("/properties/:id", route((req, res) => {
   const id = parseId(req.params.id);
   requireRecord(Property.get(id), "Property");
+  // Gallery rows cascade with the property; remove their files too.
+  const images = PropertyImage.listFor(id);
   Property.remove(id);
+  images.forEach((image) => removeStoredFile(propertyUploadsDir, image.stored_name));
+  res.json({ ok: true });
+}));
+
+// Optional property picture gallery — properties never require pictures.
+router.get("/properties/:id/images", route((req, res) => {
+  const propertyId = parseId(req.params.id);
+  requireRecord(Property.get(propertyId), "Property");
+  res.json(PropertyImage.listFor(propertyId).map((image) => ({ ...image, file_url: `/api/v1/properties/${propertyId}/images/${image.id}/file` })));
+}));
+router.post("/properties/:id/images", uploadPropertyImageFile, route((req, res) => {
+  const propertyId = parseId(req.params.id);
+  try {
+    requireRecord(Property.get(propertyId), "Property");
+    if (PropertyImage.countFor(propertyId) >= MAX_PROPERTY_IMAGES) {
+      throw new HttpError(409, `A property can have at most ${MAX_PROPERTY_IMAGES} pictures`);
+    }
+    const fileInfo = validateUploadedFile(req.file, propertyImageExtensions);
+    const result = PropertyImage.create(propertyId, {
+      original_filename: fileInfo.displayName,
+      stored_name: fileInfo.storedName,
+      file_size: fileInfo.size,
+      mime_type: fileInfo.mimeType,
+    });
+    const image = PropertyImage.get(propertyId, Number(result.lastInsertRowid));
+    res.status(201).json({ ...image, file_url: `/api/v1/properties/${propertyId}/images/${image.id}/file` });
+  } catch (error) {
+    cleanupUploadedFile(req.file);
+    throw error;
+  }
+}));
+router.get("/properties/:id/images/:imageId/file", route((req, res) => {
+  const propertyId = parseId(req.params.id);
+  const imageId = parseId(req.params.imageId, "image_id");
+  const image = requireRecord(PropertyImage.get(propertyId, imageId), "Picture");
+  const fullPath = resolveStoredFile(propertyUploadsDir, image.stored_name);
+  if (!fullPath) throw new HttpError(404, "Picture file not found");
+  return sendStoredFile(res, fullPath, image.mime_type || null, image.original_filename || image.stored_name, false);
+}));
+router.delete("/properties/:id/images/:imageId", route((req, res) => {
+  const propertyId = parseId(req.params.id);
+  const imageId = parseId(req.params.imageId, "image_id");
+  const image = requireRecord(PropertyImage.get(propertyId, imageId), "Picture");
+  PropertyImage.remove(imageId);
+  removeStoredFile(propertyUploadsDir, image.stored_name);
   res.json({ ok: true });
 }));
 

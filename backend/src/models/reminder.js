@@ -23,4 +23,16 @@ export const Reminder = {
   acknowledge(id) {
     return db.prepare("UPDATE reminders SET sent = 1 WHERE id = ?").run(id);
   },
+  // Keeps exactly one unsent reminder per debt, retimed to `remindAt`
+  // (or removed when remindAt is null, e.g. the debt was paid).
+  sync(debtId, remindAt) {
+    if (!debtId) return;
+    const existing = db.prepare("SELECT id FROM reminders WHERE debt_id = ? AND sent = 0").get(debtId);
+    if (!remindAt) {
+      if (existing) db.prepare("DELETE FROM reminders WHERE id = ?").run(existing.id);
+      return;
+    }
+    if (existing) db.prepare("UPDATE reminders SET remind_at = ? WHERE id = ?").run(remindAt, existing.id);
+    else db.prepare("INSERT INTO reminders (debt_id, remind_at) VALUES (?, ?)").run(debtId, remindAt);
+  },
 };

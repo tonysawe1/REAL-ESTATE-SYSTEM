@@ -160,6 +160,17 @@ CREATE TABLE IF NOT EXISTS reports (
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS property_images (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  property_id INTEGER NOT NULL,
+  original_filename TEXT,
+  stored_name TEXT NOT NULL,
+  file_size INTEGER,
+  mime_type TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_contracts_project ON contracts(project_id);
 CREATE INDEX IF NOT EXISTS idx_debts_contract ON debts(contract_id);
@@ -181,6 +192,10 @@ export function runMigrations() {
   ensureColumn("documents", "file_size", "INTEGER");
   ensureColumn("documents", "mime_type", "TEXT");
   ensureColumn("documents", "uploaded_at", "TEXT");
+  // Optional client link on contracts (manual client_name still supported).
+  ensureColumn("contracts", "client_id", "INTEGER REFERENCES clients(id) ON DELETE SET NULL");
+  // Optional receipt document attached to a payment.
+  ensureColumn("payments", "receipt_document_id", "INTEGER REFERENCES documents(id) ON DELETE SET NULL");
 }
 
 // Additive-only column migration: never modifies or drops existing columns.

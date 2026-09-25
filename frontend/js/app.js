@@ -24,6 +24,7 @@ const state = {
   appointments: [],
   documents: [],
   reminders: [],
+  payments: [],
   summary: null,
   projectReports: [],
   reportTypes: [],
@@ -405,6 +406,7 @@ async function refresh() {
     ["/contracts", "contracts", { fallback: [], pick: (payload) => payload }],
     ["/debts", "debts", { fallback: [], pick: (payload) => payload }],
     ["/reminders", "reminders", { fallback: [], pick: (payload) => payload }],
+    ["/payments", "payments", { fallback: [], pick: (payload) => payload }],
     ["/reports/summary", "summary", { fallback: null, pick: (payload) => payload }],
     ["/reports/by-project", "projectReports", { fallback: [], pick: (payload) => payload }],
     ["/properties", "properties", { fallback: [], pick: (payload) => payload }],
@@ -484,6 +486,61 @@ function clientOptions(selected = "") {
   return `<option value="">Select client</option>${state.clients.map((c) => `<option value="${c.id}" ${String(c.id) === String(selected) ? "selected" : ""}>${escapeHtml(c.name)}</option>`).join("")}`;
 }
 
+// Contract modal: picking a registered client fills the client name field;
+// leaving it on the first option keeps manual name entry.
+function linkedClientOptions(selected = "") {
+  const manual = `<option value="">Type client name manually</option>`;
+  if (!state.clients?.length) return manual;
+  return `${manual}${state.clients.map((c) => `<option value="${c.id}" ${String(c.id) === String(selected) ? "selected" : ""}>${escapeHtml(c.name)}</option>`).join("")}`;
+}
+
+// Photos are loaded per property on demand (kept in state.propertyPhotos).
+function renderPhotoStrip(property) {
+  const photos = (state.propertyPhotos && state.propertyPhotos[property.id]) || null;
+  if (photos === null) return `<span class="muted">Loading photos…</span>`;
+  if (!photos.length) return `<span class="muted">No photos yet.</span>`;
+  return photos.map((photo, index) => `<span class="photo-chip"><img data-src="${photo.file_url}" alt="${escapeHtml(photo.original_filename || "Photo")}" loading="lazy">${index === 0 ? `<span class="photo-cover-tag">Cover</span>` : ""}<button type="button" class="photo-remove" data-action="remove-photo" data-property="${property.id}" data-image="${photo.id}" title="Remove photo">×</button></span>`).join("");
+}
+
+// File endpoints require the Bearer token, which <img src> cannot send —
+// fetch each pending image as a blob and swap it in.
+async function hydrateImages(root = document) {
+  const images = Array.from(root.querySelectorAll("img[data-src]"));
+  await Promise.all(images.map(async (img) => {
+    const src = img.getAttribute("data-src");
+    img.removeAttribute("data-src");
+    try {
+      const token = getToken();
+      const headers = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const response = await fetch(src, { headers });
+      if (!response.ok) throw new Error(`image load failed (${response.status})`);
+      img.src = URL.createObjectURL(await response.blob());
+    } catch (_) {
+      // Pictures are optional: a missing image never breaks the view.
+      if (img.closest(".photo-chip")) img.closest(".photo-chip").remove();
+      else img.remove();
+    }
+  }));
+}
+
+async function loadPropertyPhotos(propertyId) {
+  try {
+    const photos = await api(`/properties/${propertyId}/images`);
+    if (!state.propertyPhotos) state.propertyPhotos = {};
+    state.propertyPhotos[propertyId] = photos;
+    const strip = document.getElementById("photo-strip");
+    if (strip && String(strip.dataset.propertyId) === String(propertyId)) {
+      strip.innerHTML = renderPhotoStrip(state.properties.find((p) => String(p.id) === String(propertyId)) || { id: propertyId });
+      hydrateImages(strip);
+    }
+  } catch (_) {
+    // Photos are optional — a failed load never blocks the property form.
+    if (!state.propertyPhotos) state.propertyPhotos = {};
+    state.propertyPhotos[propertyId] = [];
+  }
+}
+
 function propertyOptions(selected = "") {
   if (!state.properties?.length) return `<option value="">No properties available</option>`;
   return `<option value="">Select property</option>${state.properties.map((p) => `<option value="${p.id}" ${String(p.id) === String(selected) ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("")}`;
@@ -510,17 +567,19 @@ function renderDashboard() {
   const upcomingDebts = state.debts.filter((debt) => debtState(debt) === "upcoming").slice(0, 5);
   const upcoming = state.reminders.length ? state.reminders : upcomingDebts;
   const recent = [...state.contracts].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 5);
+  const income30 = summary.income_30d || { count: 0, total: 0 };
   const maxProjectValue = Math.max(1, ...state.projectReports.map((project) => numberValue(project.contract_value)));
   const chart = state.projectReports.length ? state.projectReports.map((project) => {
     const height = Math.max(5, Math.round(numberValue(project.contract_value) / maxProjectValue * 110));
     return `<div class="chart-col" title="${escapeHtml(project.name)}: ${money(project.contract_value)}"><div class="chart-value">${money(project.contract_value)}</div><div class="chart-bar" style="height:${height}px"></div><div class="chart-label">${escapeHtml(project.name)}</div></div>`;
   }).join("") : `<div class="empty">Add a project to begin building your portfolio.</div>`;
   content.innerHTML = `
-    <div class="grid grid-4">
+    <div class="grid grid-5">
       ${card("Active projects", summary.active_projects || 0, "Developments in progress", "▥", "teal")}
       ${card("New contracts", newContracts.count || 0, `${money(newContracts.total || 0)} active value`, "↗", "teal")}
       ${card("Open debts", pending.count || 0, `${money(pending.total || 0)} awaiting payment`, "◷", "amber")}
       ${card("Overdue", overdue.count || 0, `${money(overdue.total || 0)} needs follow-up`, "!", "red")}
+      ${card("Collected · 30 days", money(income30.total || 0), `${income30.count || 0} payment${income30.count === 1 ? "" : "s"} recorded`, "$", "teal")}
     </div>
     <div class="section grid grid-2">
       <article class="card glass"><div class="section-head"><div><h2 class="section-title">Portfolio value</h2><div class="section-note">Contract value by project</div></div><span class="badge badge-active">Live records</span></div><div class="chart">${chart}</div></article>
@@ -528,7 +587,7 @@ function renderDashboard() {
     </div>
     <div class="section grid grid-2">
       <article class="card glass"><div class="section-head"><div><h2 class="section-title">Recent contracts</h2><div class="section-note">Latest additions to the register</div></div><button class="btn btn-soft btn-small" data-action="new-contract">+ New contract</button></div>${recent.length ? `<div class="table-wrap"><table><thead><tr><th>Client</th><th>Project</th><th>Type</th><th>Value</th></tr></thead><tbody>${recent.map((contract) => `<tr><td><span class="cell-main">${escapeHtml(contract.client_name)}</span></td><td><span class="cell-sub">${escapeHtml(contract.project_name)}</span></td><td>${badge(contract.contract_type)}</td><td class="amount">${money(contract.value)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty"><strong>No contracts yet</strong>Create the first contract to start the register.</div>`}</article>
-      <article class="card glass"><div class="section-head"><div><h2 class="section-title">Payment reminders</h2><div class="section-note">Due now or within the next 7 days</div></div><button class="btn btn-soft btn-small" data-action="view-debts">View debts</button></div><div class="reminder-list">${upcoming.length ? upcoming.map((debt) => `<div class="reminder"><div class="reminder-icon">◷</div><div class="reminder-copy"><div class="reminder-title">${escapeHtml(debt.client_name)}</div><div class="reminder-meta">${escapeHtml(debt.project_name)} · ${money(debt.amount)} · due ${formatDate(debt.due_date)}</div></div><button class="btn btn-small" data-action="edit-debt" data-id="${debt.debt_id || debt.id}">Review</button></div>`).join("") : `<div class="empty"><strong>All clear</strong>No payments are due in the next 7 days.</div>`}</div></article>
+      <article class="card glass"><div class="section-head"><div><h2 class="section-title">Payment reminders</h2><div class="section-note">Due now or within the next 7 days</div></div><button class="btn btn-soft btn-small" data-action="view-debts">View debts</button></div><div class="reminder-list">${upcoming.length ? upcoming.map((debt) => `<div class="reminder"><div class="reminder-icon">◷</div><div class="reminder-copy"><div class="reminder-title">${escapeHtml(debt.client_name)}</div><div class="reminder-meta">${escapeHtml(debt.project_name)} · ${money(debt.amount)} · due ${formatDate(debt.due_date)}</div></div>${debt.remind_at ? `<button class="btn btn-small" data-action="dismiss-reminder" data-id="${debt.id}" title="Mark reminder as handled">Dismiss</button>` : ""}<button class="btn btn-small" data-action="edit-debt" data-id="${debt.debt_id || debt.id}">Review</button></div>`).join("") : `<div class="empty"><strong>All clear</strong>No payments are due in the next 7 days.</div>`}</div></article>
     </div>`;
 }
 
@@ -543,7 +602,7 @@ function renderProjects() {
 
 function renderContracts() {
   const filters = state.filters;
-  const rows = state.contracts.filter((contract) => (!filters.project || String(contract.project_id) === filters.project) && (!filters.type || contract.contract_type === filters.type) && (!filters.status || contract.status === filters.status)).map((contract) => `<tr><td><span class="cell-main">${escapeHtml(contract.client_name)}</span><span class="cell-sub">${escapeHtml(contract.project_name)}</span></td><td>${badge(contract.contract_type)}</td><td>${badge(contract.status)}</td><td>${formatDate(contract.start_date)}</td><td>${formatDate(contract.end_date)}</td><td class="amount">${money(contract.value)}</td><td><div class="row-actions"><button class="btn btn-small" data-action="edit-contract" data-id="${contract.id}">Edit</button><button class="btn btn-danger btn-small icon-btn" data-action="delete-contract" data-id="${contract.id}" title="Delete contract">×</button></div></td></tr>`).join("");
+  const rows = state.contracts.filter((contract) => (!filters.project || String(contract.project_id) === filters.project) && (!filters.type || contract.contract_type === filters.type) && (!filters.status || contract.status === filters.status)).map((contract) => `<tr><td><span class="cell-main">${escapeHtml(contract.client_name)}</span><span class="cell-sub">${escapeHtml(contract.project_name)}</span></td><td>${badge(contract.contract_type)}</td><td>${badge(contract.status)}</td><td>${formatDate(contract.start_date)}</td><td>${formatDate(contract.end_date)}</td><td class="amount">${money(contract.value)}</td><td><div class="row-actions"><button class="btn btn-small" data-action="edit-contract" data-id="${contract.id}">Edit</button><button class="btn btn-soft btn-small" data-action="generate-schedule" data-id="${contract.id}" title="Generate a payment schedule">Schedule</button><button class="btn btn-danger btn-small icon-btn" data-action="delete-contract" data-id="${contract.id}" title="Delete contract">×</button></div></td></tr>`).join("");
   content.innerHTML = `<div class="filters"><label class="muted">Filters</label>${projectSelect(filters.project)}<select class="filter-input" data-filter="type" aria-label="Filter by contract type"><option value="">All types</option><option value="new" ${filters.type === "new" ? "selected" : ""}>New</option><option value="terminal" ${filters.type === "terminal" ? "selected" : ""}>Terminal</option></select><select class="filter-input" data-filter="status" aria-label="Filter by contract status"><option value="">All statuses</option><option value="active" ${filters.status === "active" ? "selected" : ""}>Active</option><option value="closed" ${filters.status === "closed" ? "selected" : ""}>Closed</option><option value="cancelled" ${filters.status === "cancelled" ? "selected" : ""}>Cancelled</option></select></div><div class="section-head"><div><h2 class="section-title">Contract register</h2><div class="section-note">${rows ? `${rows.match(/<tr>/g)?.length || 0} visible records` : "No matching records"}</div></div><button class="btn btn-primary" data-action="new-contract">+ New contract</button></div>${rows ? `<div class="table-wrap"><table><thead><tr><th>Client / project</th><th>Type</th><th>Status</th><th>Start</th><th>End</th><th>Value</th><th class="align-right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="card glass empty"><strong>No contracts found</strong>Try another filter or create a new contract.</div>`}`;
 }
 
@@ -551,9 +610,21 @@ function renderDebts() {
   const filters = state.filters;
   const rows = state.debts.filter((debt) => (!filters.project || String(debt.project_id) === filters.project) && (!filters.debtStatus || debtState(debt) === filters.debtStatus)).map((debt) => {
     const debtStateValue = debtState(debt);
-    return `<tr><td><span class="cell-main">${escapeHtml(debt.client_name)}</span><span class="cell-sub">${escapeHtml(debt.project_name)}</span></td><td>${badge(debt.contract_type)}</td><td>${badge(debtStateValue)}</td><td>${formatDate(debt.due_date)}</td><td class="amount ${debtStateValue === "overdue" ? "danger-text" : ""}">${money(debt.amount)}</td><td>${debt.status === "paid" ? "—" : escapeHtml(debt.notes || "")}</td><td><div class="row-actions">${debt.status !== "paid" ? `<button class="btn btn-soft btn-small" data-action="pay-debt" data-id="${debt.id}">Mark paid</button>` : ""}<button class="btn btn-small" data-action="edit-debt" data-id="${debt.id}">Edit</button><button class="btn btn-danger btn-small icon-btn" data-action="delete-debt" data-id="${debt.id}" title="Delete debt">×</button></div></td></tr>`;
+    return `<tr><td><span class="cell-main">${escapeHtml(debt.client_name)}</span><span class="cell-sub">${escapeHtml(debt.project_name)}</span></td><td>${badge(debt.contract_type)}</td><td>${badge(debtStateValue)}</td><td>${formatDate(debt.due_date)}</td><td class="amount ${debtStateValue === "overdue" ? "danger-text" : ""}">${money(debt.amount)}</td><td>${debt.status === "paid" ? "—" : escapeHtml(debt.notes || "")}</td><td><div class="row-actions">${debt.status !== "paid" ? `<button class="btn btn-soft btn-small" data-action="pay-debt" data-id="${debt.id}">Mark paid</button><button class="btn btn-small" data-action="record-payment" data-id="${debt.id}" title="Record a payment with an optional receipt">Record payment</button>` : ""}<button class="btn btn-small" data-action="edit-debt" data-id="${debt.id}">Edit</button><button class="btn btn-danger btn-small icon-btn" data-action="delete-debt" data-id="${debt.id}" title="Delete debt">×</button></div></td></tr>`;
   }).join("");
-  content.innerHTML = `<div class="filters"><label class="muted">Filters</label>${projectSelect(filters.project)}<select class="filter-input" data-filter="debtStatus" aria-label="Filter by debt state"><option value="">All debt states</option><option value="pending" ${filters.debtStatus === "pending" ? "selected" : ""}>Pending</option><option value="upcoming" ${filters.debtStatus === "upcoming" ? "selected" : ""}>Upcoming</option><option value="overdue" ${filters.debtStatus === "overdue" ? "selected" : ""}>Overdue</option><option value="paid" ${filters.debtStatus === "paid" ? "selected" : ""}>Paid</option></select></div><div class="section-head"><div><h2 class="section-title">Debt register</h2><div class="section-note">Client balances linked to contracts</div></div><button class="btn btn-primary" data-action="new-debt">+ New debt</button></div>${rows ? `<div class="table-wrap"><table><thead><tr><th>Client / project</th><th>Contract</th><th>State</th><th>Due date</th><th>Amount</th><th>Note</th><th class="align-right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="card glass empty"><strong>No debts found</strong>Add a debt to a contract or change the filters.</div>`}`;
+  content.innerHTML = `<div class="filters"><label class="muted">Filters</label>${projectSelect(filters.project)}<select class="filter-input" data-filter="debtStatus" aria-label="Filter by debt state"><option value="">All debt states</option><option value="pending" ${filters.debtStatus === "pending" ? "selected" : ""}>Pending</option><option value="upcoming" ${filters.debtStatus === "upcoming" ? "selected" : ""}>Upcoming</option><option value="overdue" ${filters.debtStatus === "overdue" ? "selected" : ""}>Overdue</option><option value="paid" ${filters.debtStatus === "paid" ? "selected" : ""}>Paid</option></select></div><div class="section-head"><div><h2 class="section-title">Debt register</h2><div class="section-note">Client balances linked to contracts</div></div><button class="btn btn-primary" data-action="new-debt">+ New debt</button></div>${rows ? `<div class="table-wrap"><table><thead><tr><th>Client / project</th><th>Contract</th><th>State</th><th>Due date</th><th>Amount</th><th>Note</th><th class="align-right">Actions</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="card glass empty"><strong>No debts found</strong>Add a debt to a contract or change the filters.</div>`}
+    <div class="section">
+      <div class="section-head"><div><h2 class="section-title">Recorded payments</h2><div class="section-note">Money actually received, with receipts</div></div><button class="btn btn-soft btn-small" data-action="new-payment">+ Record payment</button></div>
+      ${renderPaymentsTable()}
+    </div>`;
+}
+
+// Payments history under the debts view; receipts open in a new tab.
+function renderPaymentsTable() {
+  const payments = [...(state.payments || [])].sort((a, b) => String(b.paid_at).localeCompare(String(a.paid_at)));
+  if (!payments.length) return `<div class="card glass empty"><strong>No payments recorded</strong>Use “Record payment” on a debt to log income with an optional receipt.</div>`;
+  const rows = payments.map((payment) => `<tr><td><span class="cell-main">${escapeHtml(payment.client_name)}</span><span class="cell-sub">${escapeHtml(payment.project_name || "")}</span></td><td>${formatDate(payment.paid_at, String(payment.paid_at).length > 10)}</td><td>${badge(payment.method, "neutral")}</td><td class="amount">${money(payment.amount)}</td><td>${escapeHtml(payment.reference || "—")}</td><td><div class="row-actions">${payment.has_receipt ? `<button class="btn btn-small" data-action="open-receipt" data-id="${payment.id}">View receipt</button>` : `<span class="muted">None</span>`}<button class="btn btn-danger btn-small icon-btn" data-action="delete-payment" data-id="${payment.id}" title="Delete payment">×</button></div></td></tr>`).join("");
+  return `<div class="table-wrap"><table><thead><tr><th>Client / project</th><th>Paid at</th><th>Method</th><th>Amount</th><th>Reference</th><th class="align-right">Receipt & actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderReports() {
@@ -609,7 +680,11 @@ function renderProperties() {
   );
   const list = rows.map((property) => {
     const price = money(property.price);
+    const cover = property.cover_image_id
+      ? `<div class="property-cover"><img data-src="${API_ROOT}/properties/${property.id}/images/${property.cover_image_id}/file" alt="${escapeHtml(property.name)}" loading="lazy"></div>`
+      : "";
     return `<div class="property-card">
+      ${cover}
       <div class="property-head">
         <div class="property-name">${escapeHtml(property.name)}</div>
         <div class="property-type">${badge(property.property_type, "neutral")}</div>
@@ -620,6 +695,7 @@ function renderProperties() {
         ${property.location ? `<div><span class="muted">Location</span>${escapeHtml(property.location)}</div>` : ""}
         ${property.area ? `<div><span class="muted">Area</span>${numberValue(property.area)} units</div>` : ""}
         ${(property.bedrooms || property.bathrooms) ? `<div><span class="muted">Layout</span>${property.bedrooms || 0} bed · ${property.bathrooms || 0} bath</div>` : ""}
+        ${property.image_count ? `<div><span class="muted">Photos</span>${property.image_count}</div>` : ""}
       </div>
       ${property.description ? `<p class="property-desc">${escapeHtml(property.description)}</p>` : ""}
       <div class="property-foot">
@@ -853,7 +929,7 @@ function render() {
     state.view === "properties" ? `<button class="btn btn-primary" data-action="new-property">+ New property</button>` :
     state.view === "clients" ? `<button class="btn btn-primary" data-action="new-client">+ New client</button>` :
     state.view === "contracts" ? `<button class="btn btn-primary" data-action="new-contract">+ New contract</button>` :
-    state.view === "debts" ? `<button class="btn btn-primary" data-action="new-debt">+ New debt</button>` :
+    state.view === "debts" ? `<button class="btn btn-primary" data-action="new-debt">+ New debt</button><button class="btn" data-action="new-payment">+ Record payment</button>` :
     state.view === "appointments" ? `<button class="btn btn-primary" data-action="new-appointment">+ New appointment</button>` :
     state.view === "documents" ? `<button class="btn btn-primary" data-action="new-document">+ New document</button>` :
     state.view === "reports" ? `<button class="btn btn-primary" data-action="open-report-generate">+ Generate report</button><button class="btn" data-action="open-report-upload">+ Upload report</button>` :
@@ -868,6 +944,8 @@ function render() {
   if (state.view === "appointments") renderAppointments();
   if (state.view === "documents") renderDocuments();
   if (state.view === "reports") renderReports();
+  // Authenticated image blobs for property covers, etc.
+  hydrateImages(content);
 }
 
 function openModal(type, record = null) {
@@ -884,7 +962,39 @@ function openModal(type, record = null) {
   if (type === "contract") {
     title = record ? "Edit contract" : "New contract";
     subtitle = record ? "Update contract details." : "Link a client agreement to a project.";
-    body = `<div class="form-grid"><div class="field full"><label for="field-project">Project</label><select id="field-project" name="project_id" required><option value="">Select project</option>${projectOptions(record?.project_id)}</select></div><div class="field"><label for="field-client">Client name</label><input id="field-client" name="client_name" required maxlength="120" value="${escapeHtml(record?.client_name || "")}" placeholder="Client full name"></div><div class="field"><label for="field-type">Contract type</label><select id="field-type" name="contract_type" required><option value="new" ${record?.contract_type === "new" ? "selected" : ""}>New</option><option value="terminal" ${record?.contract_type === "terminal" ? "selected" : ""}>Terminal</option></select></div><div class="field"><label for="field-contract-status">Status</label><select id="field-contract-status" name="status"><option value="active" ${record?.status !== "closed" && record?.status !== "cancelled" ? "selected" : ""}>Active</option><option value="closed" ${record?.status === "closed" ? "selected" : ""}>Closed</option><option value="cancelled" ${record?.status === "cancelled" ? "selected" : ""}>Cancelled</option></select></div><div class="field"><label for="field-value">Contract value</label><input id="field-value" name="value" type="number" min="0" step="0.01" required value="${escapeHtml(record?.value ?? "")}" placeholder="0"></div><div class="field"><label for="field-start">Start date</label><input id="field-start" name="start_date" type="date" value="${escapeHtml(record?.start_date || "")}"></div><div class="field"><label for="field-end">End date</label><input id="field-end" name="end_date" type="date" value="${escapeHtml(record?.end_date || "")}"></div><div class="field full"><label for="field-notes">Notes</label><textarea id="field-notes" name="notes" placeholder="Property, unit, payment terms, or reference">${escapeHtml(record?.notes || "")}</textarea></div></div>`;
+    body = `<div class="form-grid"><div class="field full"><label for="field-project">Project</label><select id="field-project" name="project_id" required><option value="">Select project</option>${projectOptions(record?.project_id)}</select></div><div class="field full"><label for="field-linked-client">Client from register (optional)</label><select id="field-linked-client" name="client_id">${linkedClientOptions(record?.client_id)}</select></div><div class="field"><label for="field-client">Client name</label><input id="field-client" name="client_name" required maxlength="120" value="${escapeHtml(record?.client_name || "")}" placeholder="Client full name"></div><div class="field"><label for="field-type">Contract type</label><select id="field-type" name="contract_type" required><option value="new" ${record?.contract_type === "new" ? "selected" : ""}>New</option><option value="terminal" ${record?.contract_type === "terminal" ? "selected" : ""}>Terminal</option></select></div><div class="field"><label for="field-contract-status">Status</label><select id="field-contract-status" name="status"><option value="active" ${record?.status !== "closed" && record?.status !== "cancelled" ? "selected" : ""}>Active</option><option value="closed" ${record?.status === "closed" ? "selected" : ""}>Closed</option><option value="cancelled" ${record?.status === "cancelled" ? "selected" : ""}>Cancelled</option></select></div><div class="field"><label for="field-value">Contract value</label><input id="field-value" name="value" type="number" min="0" step="0.01" required value="${escapeHtml(record?.value ?? "")}" placeholder="0"></div><div class="field"><label for="field-start">Start date</label><input id="field-start" name="start_date" type="date" value="${escapeHtml(record?.start_date || "")}"></div><div class="field"><label for="field-end">End date</label><input id="field-end" name="end_date" type="date" value="${escapeHtml(record?.end_date || "")}"></div><div class="field full"><label for="field-notes">Notes</label><textarea id="field-notes" name="notes" placeholder="Property, unit, payment terms, or reference">${escapeHtml(record?.notes || "")}</textarea></div></div>`;
+  }
+  if (type === "schedule") {
+    title = "Generate payment schedule";
+    subtitle = record ? `Deposit + installments for ${escapeHtml(record.client_name)} · ${money(record.value)}` : "Deposit + equal monthly installments.";
+    submitLabel = "Generate schedule";
+    const hasDebts = (state.debts || []).some((debt) => String(debt.contract_id) === String(record?.id));
+    body = `<div class="form-grid">
+      <div class="field"><label for="field-deposit">Deposit now</label><input id="field-deposit" name="deposit" type="number" min="0" step="0.01" value="0" placeholder="0"></div>
+      <div class="field"><label for="field-installments">Installments</label><input id="field-installments" name="installments" type="number" min="1" max="120" required value="6"></div>
+      <div class="field full"><label for="field-first-due">First installment due</label><input id="field-first-due" name="first_due_date" type="date" required value="${today()}"></div>
+      ${hasDebts ? `<div class="field full"><label class="checkbox-field"><input type="checkbox" name="replace" value="yes"><span>This contract already has installments — replace them</span></label></div>` : ""}
+      <div class="field full"><div class="field-help">Installments split the remaining value (${money(Math.max(0, numberValue(record?.value) - 0))}) equally, due monthly from the first date. The final installment absorbs rounding. Reminders are created automatically.</div></div>
+    </div>`;
+  }
+  if (type === "payment") {
+    title = "Record payment";
+    subtitle = "Log money received; attaching a receipt is optional.";
+    submitLabel = "Record payment";
+    const methods = (state.reportPaymentMethods || []).length
+      ? state.reportPaymentMethods
+      : [{ value: "cash", label: "Cash" }, { value: "bank", label: "Bank transfer" }, { value: "mobile", label: "Mobile money" }, { value: "card", label: "Card" }, { value: "other", label: "Other" }];
+    const prefill = record || {};
+    body = `<div class="form-grid">
+      <div class="field full"><label for="field-payment-contract">Contract</label><select id="field-payment-contract" name="contract_id" required><option value="">Select contract</option>${contractOptions(prefill.contract_id)}</select></div>
+      <div class="field"><label for="field-payment-debt">Installment (optional)</label><select id="field-payment-debt" name="debt_id"><option value="">None — general payment</option>${(state.debts || []).filter((debt) => !prefill.contract_id || String(debt.contract_id) === String(prefill.contract_id)).map((debt) => `<option value="${debt.id}" ${String(debt.id) === String(prefill.debt_id || "") ? "selected" : ""}>${escapeHtml(debt.client_name)} · ${money(debt.amount)} · ${formatDate(debt.due_date)}</option>`).join("")}</select></div>
+      <div class="field"><label for="field-payment-amount">Amount</label><input id="field-payment-amount" name="amount" type="number" min="0" step="0.01" required value="${escapeHtml(prefill.amount ?? "")}" placeholder="0"></div>
+      <div class="field"><label for="field-payment-date">Paid at</label><input id="field-payment-date" name="paid_at" type="date" required value="${today()}"></div>
+      <div class="field"><label for="field-payment-method">Method</label><select id="field-payment-method" name="method">${methods.map((m) => `<option value="${escapeHtml(m.value)}">${escapeHtml(m.label)}</option>`).join("")}</select></div>
+      <div class="field"><label for="field-payment-reference">Reference</label><input id="field-payment-reference" name="reference" maxlength="120" placeholder="Receipt no. / transaction ID"></div>
+      <div class="field full"><label for="field-payment-receipt">Receipt (optional)</label><input id="field-payment-receipt" name="file" type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp,.bmp"><div class="field-help">PDF or image of the receipt. You can attach it later too.</div></div>
+      <div class="field full"><label for="field-payment-notes">Notes</label><textarea id="field-payment-notes" name="notes" maxlength="2000" placeholder="Purpose or follow-up note">${escapeHtml(prefill.notes || "")}</textarea></div>
+    </div>`;
   }
   if (type === "debt") {
     title = record ? "Edit debt" : "New debt";
@@ -906,6 +1016,8 @@ function openModal(type, record = null) {
       <div class="field"><label for="field-bathrooms">Bathrooms</label><input id="field-bathrooms" name="bathrooms" type="number" min="0" value="${escapeHtml(record?.bathrooms ?? "")}" placeholder="0"></div>
       <div class="field full"><label for="field-description">Description</label><textarea id="field-description" name="description" maxlength="2000" placeholder="Property summary">${escapeHtml(record?.description || "")}</textarea></div>
       <div class="field"><label class="checkbox-field"><input type="checkbox" name="featured" ${record?.featured ? "checked" : ""}><span>Featured listing</span></label></div>
+      ${record ? `<div class="field full"><label>Photos (optional)</label><div class="photo-strip" id="photo-strip" data-property-id="${record.id}">${renderPhotoStrip(record)}</div></div>` : ""}
+      <div class="field full"><label for="field-photo">Photo (optional)</label><input id="field-photo" name="photo" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.bmp" data-photo-upload>${record ? "" : `<div class="field-help">Optional. You can add more photos after saving.</div>`}</div>
     </div>`;
   }
   if (type === "client") {
@@ -980,6 +1092,7 @@ function openModal(type, record = null) {
     ? `${head}${body}${actions}`
     : `${head}<form id="record-form" data-id="${escapeHtml(record?.id || "")}">${body}${actions}</form>`;
   modalBackdrop.hidden = false;
+  hydrateImages(modal);
   const contractSelect = document.getElementById("field-contract");
   const clientInput = document.getElementById("field-debt-client");
   if (contractSelect && clientInput) {
@@ -987,6 +1100,31 @@ function openModal(type, record = null) {
     contractSelect.addEventListener("change", syncClient);
     syncClient();
   }
+  // Contract modal: selecting a registered client fills the name field.
+  const linkedClientSelect = document.getElementById("field-linked-client");
+  const contractClientInput = document.getElementById("field-client");
+  if (linkedClientSelect && contractClientInput) {
+    linkedClientSelect.addEventListener("change", () => {
+      const client = (state.clients || []).find((item) => String(item.id) === linkedClientSelect.value);
+      if (client) contractClientInput.value = client.name;
+    });
+  }
+  // Payment modal: changing the contract refilters installments and default client.
+  const paymentContractSelect = document.getElementById("field-payment-contract");
+  const paymentDebtSelect = document.getElementById("field-payment-debt");
+  if (paymentContractSelect && paymentDebtSelect) {
+    paymentContractSelect.addEventListener("change", () => {
+      const contractId = paymentContractSelect.value;
+      const contract = state.contracts.find((item) => String(item.id) === contractId);
+      const options = (state.debts || []).filter((debt) => !contractId || String(debt.contract_id) === contractId)
+        .map((debt) => `<option value="${debt.id}">${escapeHtml(debt.client_name)} · ${money(debt.amount)} · ${formatDate(debt.due_date)}</option>`).join("");
+      paymentDebtSelect.innerHTML = `<option value="">None — general payment</option>${options}`;
+      const amountInput = document.getElementById("field-payment-amount");
+      if (contract && amountInput && !amountInput.value) amountInput.placeholder = String(contract.value ?? "0");
+    });
+  }
+  // Property modal: load the optional gallery after render.
+  if (type === "property" && record?.id) loadPropertyPhotos(record.id);
   const reportTypeSelect = document.getElementById("field-report-type");
   if (reportTypeSelect && document.getElementById("report-filter-fields")) {
     // The filter set follows the selected report type.
@@ -1030,9 +1168,39 @@ async function handleFormSubmit(event) {
     } else if (type === "contract") {
       data.project_id = Number(data.project_id);
       data.value = numberValue(data.value);
+      // Empty string (not null) so the API can unlink an existing client.
+      data.client_id = data.client_id ? Number(data.client_id) : "";
       if (id) await api(`/contracts/${id}`, { method: "PUT", body: JSON.stringify(data) });
       else await api("/contracts", { method: "POST", body: JSON.stringify(data) });
       showToast(id ? "Contract updated." : "Contract created.");
+    } else if (type === "schedule") {
+      const payload = {
+        deposit: numberValue(data.deposit, 0),
+        installments: Number(data.installments),
+        first_due_date: data.first_due_date,
+        replace: data.replace === "yes",
+      };
+      const result = await api(`/contracts/${id}/schedule`, { method: "POST", body: JSON.stringify(payload) });
+      showToast(`Schedule created: ${result.created} installment${result.created === 1 ? "" : "s"}.`);
+    } else if (type === "payment") {
+      data.contract_id = Number(data.contract_id);
+      data.debt_id = data.debt_id ? Number(data.debt_id) : null;
+      data.amount = numberValue(data.amount);
+      const receiptFile = form.querySelector('input[type="file"][name="file"]')?.files?.[0] || null;
+      delete data.file;
+      if (receiptFile) {
+        // Multipart path stores the receipt alongside the payment record.
+        const payload = new FormData();
+        payload.append("file", receiptFile);
+        ["contract_id", "debt_id", "amount", "paid_at", "method", "reference", "notes"].forEach((key) => {
+          if (data[key] !== undefined && data[key] !== null && data[key] !== "") payload.append(key, data[key]);
+        });
+        await api("/payments/upload", { method: "POST", form: true, body: payload });
+        showToast("Payment recorded with receipt.");
+      } else {
+        await api("/payments", { method: "POST", body: JSON.stringify(data) });
+        showToast("Payment recorded.");
+      }
     } else if (type === "debt") {
       data.contract_id = Number(data.contract_id);
       data.amount = numberValue(data.amount);
@@ -1046,9 +1214,25 @@ async function handleFormSubmit(event) {
       data.bedrooms = numberValue(data.bedrooms, 0);
       data.bathrooms = numberValue(data.bathrooms, 0);
       data.featured = data.featured ? 1 : 0;
-      if (id) await api(`/properties/${id}`, { method: "PUT", body: JSON.stringify(data) });
-      else await api("/properties", { method: "POST", body: JSON.stringify(data) });
-      showToast(id ? "Property updated." : "Property created.");
+      const photoFile = form.querySelector('input[type="file"][name="photo"]')?.files?.[0] || null;
+      delete data.photo;
+      const saved = id
+        ? await api(`/properties/${id}`, { method: "PUT", body: JSON.stringify(data) })
+        : await api("/properties", { method: "POST", body: JSON.stringify(data) });
+      if (photoFile && saved?.id) {
+        // Photos are optional: a failed upload reports but never blocks the save.
+        const payload = new FormData();
+        payload.append("file", photoFile);
+        try {
+          await api(`/properties/${saved.id}/images`, { method: "POST", form: true, body: payload });
+          if (state.propertyPhotos) delete state.propertyPhotos[saved.id];
+          showToast(id ? "Property and photo updated." : "Property and photo created.");
+        } catch (photoError) {
+          showToast(photoError.message || "Photo could not be uploaded.");
+        }
+      } else {
+        showToast(id ? "Property updated." : "Property created.");
+      }
     } else if (type === "client") {
       data.project_id = data.project_id ? Number(data.project_id) : null;
       if (id) await api(`/clients/${id}`, { method: "PUT", body: JSON.stringify(data) });
@@ -1106,8 +1290,8 @@ async function handleFormSubmit(event) {
 }
 
 async function deleteRecord(type, id) {
-  const labels = { project: "project", contract: "contract", debt: "debt", property: "property", client: "client", appointment: "appointment", document: "document", report: "report" };
-  const endpoints = { project: "projects", contract: "contracts", debt: "debts", property: "properties", client: "clients", appointment: "appointments", document: "documents", report: "reports" };
+  const labels = { project: "project", contract: "contract", debt: "debt", property: "property", client: "client", appointment: "appointment", document: "document", report: "report", payment: "payment" };
+  const endpoints = { project: "projects", contract: "contracts", debt: "debts", property: "properties", client: "clients", appointment: "appointments", document: "documents", report: "reports", payment: "payments" };
   const label = labels[type] || type;
   const endpoint = endpoints[type] || type;
   if (!window.confirm(`Delete this ${label}? This action cannot be undone.`)) return;
@@ -1124,6 +1308,34 @@ async function markPaid(id) {
     showToast("Debt marked as paid.");
     await refresh();
   } catch (error) { showToast(error.message || "Unable to update debt."); }
+}
+
+async function dismissReminder(id) {
+  try {
+    await api(`/reminders/${id}/acknowledge`, { method: "POST", body: "{}" });
+    showToast("Reminder dismissed.");
+    await refresh();
+  } catch (error) { showToast(error.message || "Unable to dismiss reminder."); }
+}
+
+async function removePropertyPhoto(propertyId, imageId) {
+  try {
+    await api(`/properties/${propertyId}/images/${imageId}`, { method: "DELETE" });
+    if (state.propertyPhotos) delete state.propertyPhotos[propertyId];
+    showToast("Photo removed.");
+    const strip = document.getElementById("photo-strip");
+    if (strip) loadPropertyPhotos(propertyId);
+    await refresh();
+  } catch (error) { showToast(error.message || "Unable to remove photo."); }
+}
+
+// One-click consistent backup of the SQLite database, then downloads it.
+async function createBackup() {
+  try {
+    const backup = await api("/backups", { method: "POST", body: "{}" });
+    showToast(`Backup created: ${backup.name}`);
+    await downloadFile(`/backups/${encodeURIComponent(backup.name)}/download`, backup.name);
+  } catch (error) { showToast(error.message || "Backup failed."); }
 }
 
 async function previewReport() {
@@ -1185,6 +1397,17 @@ document.addEventListener("click", async (event) => {
   if (action === "edit-debt") openModal("debt", state.debts.find((item) => String(item.id) === id));
   if (action === "delete-debt") deleteRecord("debt", id);
   if (action === "pay-debt") markPaid(id);
+  if (action === "generate-schedule") openModal("schedule", state.contracts.find((item) => String(item.id) === id));
+  if (action === "new-payment") openModal("payment");
+  if (action === "record-payment") {
+    const debt = state.debts.find((item) => String(item.id) === id);
+    if (debt) openModal("payment", { contract_id: debt.contract_id, debt_id: debt.id, amount: debt.amount });
+  }
+  if (action === "delete-payment") deleteRecord("payment", id);
+  if (action === "open-receipt") openFileInTab(`/payments/${id}/receipt`).catch((error) => showToast(error.message));
+  if (action === "dismiss-reminder") dismissReminder(id);
+  if (action === "remove-photo") removePropertyPhoto(target.dataset.property, target.dataset.image);
+  if (action === "backup-now") createBackup();
   if (action === "new-client") openModal("client");
   if (action === "edit-client") openModal("client", state.clients.find((item) => String(item.id) === id));
   if (action === "delete-client") deleteRecord("client", id);

@@ -17,6 +17,9 @@ export const Report = {
     const clientsActive = db.prepare("SELECT COUNT(*) as count FROM clients WHERE status='active'").get();
     const appointmentsScheduled = db.prepare("SELECT COUNT(*) as count FROM appointments WHERE status='scheduled'").get();
     const documentsPending = db.prepare("SELECT COUNT(*) as count FROM documents WHERE status='pending'").get();
+    // Actual money received: total and within the last 30 days.
+    const incomeAll = db.prepare("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments").get();
+    const income30 = db.prepare("SELECT COUNT(*) as count, COALESCE(SUM(amount),0) as total FROM payments WHERE paid_at >= datetime('now', '-30 days')").get();
     return {
       active_projects: projects.count,
       contracts_total: contractsTotal.count,
@@ -29,6 +32,8 @@ export const Report = {
       clients_active: clientsActive.count,
       appointments_scheduled: appointmentsScheduled.count,
       documents_pending: documentsPending.count,
+      income_all: { count: incomeAll.count, total: incomeAll.total },
+      income_30d: { count: income30.count, total: income30.total },
     };
   },
   byProject() {

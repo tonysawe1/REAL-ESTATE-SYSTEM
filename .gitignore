@@ -6,20 +6,28 @@ node_modules/
 .env.*
 !.env.example
 
-# SQLite database (data/system.db + -shm/-wal sidecars) and backups
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/*.bak*
-
-# Uploaded documents
+# Runtime database, uploads, backups, and test output
+data/
+*.db
+*.db-shm
+*.db-wal
+*.bak*
 uploads/
+backups/
 
 # Temp / test / generated outputs
 *-output.txt
 e2e-*
+e2e_*.txt
 check-*
-migrate-*
+check_*.txt
+syntax_*.txt
+*_check.txt
+*_check.log
+current.diff
+status.txt
+validation.log
+server_test.log
 *.tmp
 *.log
 npm-debug.log*
